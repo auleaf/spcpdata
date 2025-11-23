@@ -1,0 +1,5 @@
+build/
+external/
+*.o
+*.exe
+*.log
