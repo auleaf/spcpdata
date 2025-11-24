@@ -1,5 +1,7 @@
 {
     "files.associations": {
-        "future": "cpp"
-    }
+        "future": "cpp",
+        "cstring": "cpp"
+    },
+    "C_Cpp.errorSquiggles": "enabled"
 }

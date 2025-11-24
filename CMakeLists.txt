@@ -4,7 +4,7 @@ project(httpserver)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(USE_MYSQL "Enable MySQL support (optional)" OFF)
+option(USE_MYSQL "Enable MySQL support (optional)" ON)
 option(USE_HIREDIS "Enable hiredis (Redis) support (optional)" OFF)
 
 # 用户可配置的MySQL安装路径
@@ -128,17 +128,23 @@ if(USE_HIREDIS)
   endif()
 endif()
 
-add_executable(httpserver src/main.cpp)
+add_executable(httpserver src/main.cpp src/mysql_wrapper.cpp)
 
 target_include_directories(httpserver PRIVATE ${CMAKE_SOURCE_DIR}/external/httplib ${CMAKE_SOURCE_DIR}/external/json)
 
 if(HAVE_MYSQL)
   target_compile_definitions(httpserver PRIVATE HAVE_MYSQL=1)
+  # 确保设置MySQL_LIBRARIES变量
+  set(MySQL_LIBRARIES ${MySQL_LIBRARY})
+  
   if(TARGET MySQL::MySQL)
     target_link_libraries(httpserver PRIVATE MySQL::MySQL)
   else()
-    target_link_libraries(httpserver PRIVATE ${MySQL_LIBRARIES})
+    target_link_libraries(httpserver PRIVATE ${MySQL_LIBRARY})
   endif()
+  
+  # 添加MySQL相关的编译定义
+  target_compile_definitions(httpserver PRIVATE HAVE_MYSQL)
 endif()
 
 if(HAVE_HIREDIS)

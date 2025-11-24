@@ -4,7 +4,9 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <mysql/mysql.h>
+
+#include <mysql.h>
+
 
 /**
  * MySQL数据库封装类

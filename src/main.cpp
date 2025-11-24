@@ -4,6 +4,7 @@
 #include <vector>
 #include <future>
 #include <chrono>
+#include <memory>
 
 // 第三方库头文件
 #include "json.hpp"
@@ -11,6 +12,9 @@ using json = nlohmann::json;
 
 #include "httplib.h"
 using namespace httplib;
+
+// MySQL封装类
+#include "mysql_wrapper.h"
 
 // Redis相关代码
 #ifdef HAVE_HIREDIS
@@ -57,6 +61,38 @@ int main(int argc, char **argv) {
 
     // 用于存储异步任务的future对象
     std::vector<std::future<void>> async_tasks;
+    
+    // MySQL连接
+    std::unique_ptr<MySQLWrapper> mysql;
+    if (cfg.contains("mysql")) {
+        auto& mysql_cfg = cfg["mysql"];
+        std::string mysql_host = mysql_cfg.value("host", "127.0.0.1");
+        std::string mysql_user = mysql_cfg.value("user", "root");
+        std::string mysql_pass = mysql_cfg.value("password", "");
+        std::string mysql_db = mysql_cfg.value("database", "test");
+        int mysql_port = mysql_cfg.value("port", 3306);
+        
+        mysql = std::make_unique<MySQLWrapper>();
+        if (mysql->connect(mysql_host, mysql_user, mysql_pass, mysql_db, mysql_port)) {
+            std::cout << "MySQL connected successfully" << std::endl;
+            
+            // 尝试创建测试表
+            std::string create_table_sql = R"(
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    email VARCHAR(100) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            )";
+            if (mysql->execute(create_table_sql) < 0) {
+                std::cerr << "Failed to create table: " << mysql->getLastError() << std::endl;
+            }
+        } else {
+            std::cerr << "Failed to connect to MySQL: " << mysql->getLastError() << std::endl;
+            mysql.reset();
+        }
+    }
 
     // Redis连接
 #ifdef HAVE_HIREDIS
@@ -102,6 +138,192 @@ int main(int argc, char **argv) {
     svr.Post("/echo", [&](const Request &req, Response &res){
         res.set_content(req.body, req.get_header_value("Content-Type").c_str());
     });
+    
+    // MySQL API endpoints
+    
+    // 获取用户列表
+    svr.Get("/api/users", [&](const Request &req, Response &res){
+        if (!mysql) {
+            res.status = 503;
+            json err = { {"error", "Database not available"} };
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        
+        auto result = mysql->query("SELECT * FROM users");
+        if (!mysql->getLastError().empty()) {
+            res.status = 500;
+            json err = { {"error", mysql->getLastError()} };
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        
+        json response = json::array();
+        for (const auto& row : result) {
+            response.push_back(row);
+        }
+        res.set_content(response.dump(), "application/json");
+    });
+    
+    // 添加用户
+    svr.Post("/api/users", [&](const Request &req, Response &res){
+        if (!mysql) {
+            res.status = 503;
+            json err = { {"error", "Database not available"} };
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        
+        try {
+            auto j = json::parse(req.body);
+            if (!j.contains("name") || !j.contains("email")) {
+                res.status = 400;
+                json err = { {"error", "Missing required fields: name and email"} };
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            
+            std::string name = j["name"];
+            std::string email = j["email"];
+            
+            // 转义字符串防止SQL注入
+            name = mysql->escapeString(name);
+            email = mysql->escapeString(email);
+            
+            std::string sql = "INSERT INTO users (name, email) VALUES ('" + name + "', '" + email + "')";
+            int affected_rows = mysql->execute(sql);
+            
+            if (affected_rows < 0) {
+                res.status = 500;
+                json err = { {"error", mysql->getLastError()} };
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            
+            unsigned long long insert_id = mysql->getLastInsertId();
+            json response = {
+                {"success", true},
+                {"message", "User created successfully"},
+                {"user_id", insert_id},
+                {"affected_rows", affected_rows}
+            };
+            res.set_content(response.dump(), "application/json");
+        } catch (const std::exception &e) {
+            res.status = 400;
+            json err = { {"error", "Invalid JSON"}, {"message", e.what()} };
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+    
+    // 更新用户
+    svr.Put("/api/users/:id", [&](const Request &req, Response &res){
+        if (!mysql) {
+            res.status = 503;
+            json err = { {"error", "Database not available"} };
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        
+        try {
+            std::string id = req.path_params.at("id");
+            auto j = json::parse(req.body);
+            
+            std::string updates;
+            if (j.contains("name")) {
+                updates += "name = '" + mysql->escapeString(j["name"]) + "'";
+            }
+            if (j.contains("email")) {
+                if (!updates.empty()) updates += ", ";
+                updates += "email = '" + mysql->escapeString(j["email"]) + "'";
+            }
+            
+            if (updates.empty()) {
+                res.status = 400;
+                json err = { {"error", "No fields to update"} };
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            
+            std::string sql = "UPDATE users SET " + updates + " WHERE id = " + mysql->escapeString(id);
+            int affected_rows = mysql->execute(sql);
+            
+            if (affected_rows < 0) {
+                res.status = 500;
+                json err = { {"error", mysql->getLastError()} };
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            
+            json response = {
+                {"success", true},
+                {"message", "User updated successfully"},
+                {"affected_rows", affected_rows}
+            };
+            res.set_content(response.dump(), "application/json");
+        } catch (const std::exception &e) {
+            res.status = 400;
+            json err = { {"error", "Invalid JSON"}, {"message", e.what()} };
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+    
+    // 删除用户
+    svr.Delete("/api/users/:id", [&](const Request &req, Response &res){
+        if (!mysql) {
+            res.status = 503;
+            json err = { {"error", "Database not available"} };
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        
+        std::string id = req.path_params.at("id");
+        std::string sql = "DELETE FROM users WHERE id = " + mysql->escapeString(id);
+        int affected_rows = mysql->execute(sql);
+        
+        if (affected_rows < 0) {
+            res.status = 500;
+            json err = { {"error", mysql->getLastError()} };
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        
+        json response = {
+            {"success", true},
+            {"message", "User deleted successfully"},
+            {"affected_rows", affected_rows}
+        };
+        res.set_content(response.dump(), "application/json");
+    });
+    
+    // 获取单个用户
+    svr.Get("/api/users/:id", [&](const Request &req, Response &res){
+        if (!mysql) {
+            res.status = 503;
+            json err = { {"error", "Database not available"} };
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        
+        std::string id = req.path_params.at("id");
+        std::string sql = "SELECT * FROM users WHERE id = " + mysql->escapeString(id);
+        auto result = mysql->query(sql);
+        
+        if (!mysql->getLastError().empty()) {
+            res.status = 500;
+            json err = { {"error", mysql->getLastError()} };
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        
+        if (result.empty()) {
+            res.status = 404;
+            json err = { {"error", "User not found"} };
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        
+        res.set_content(json(result[0]).dump(), "application/json");
+    });
 
     // 启动服务器
     std::cout << "Server listening on " << host << ":" << port << "\n";
@@ -117,6 +339,9 @@ int main(int argc, char **argv) {
     }
     async_tasks.clear();
 
+    // 关闭MySQL连接
+    // MySQL连接会在unique_ptr析构时自动断开
+    
     // 关闭Redis连接
 #ifdef HAVE_HIREDIS
     if (redis) redisFree(redis);
